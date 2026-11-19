@@ -25,3 +25,6 @@ out/
 
 # IDE
 .vscode/
+
+# Generated database (rebuild with: python main.py)
+*.db
