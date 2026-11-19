@@ -2,10 +2,10 @@
 
 Run:  streamlit run app.py
 
-Reads the cleaned 1-minute bars (bars_1m) for one ticker and day and resamples
-them to 1m / 5m / 15m / 30m / 1h in pandas. Switching frequency doesn't query
-the database again: the day's 1m data is cached, and resampling ~400 rows
-takes about a millisecond.
+Loads a ticker's cleaned 1-minute bars (bars_1m) once, then slices the chosen
+range of trading dates and resamples it to 1m / 5m / 15m / 30m / 1h in pandas.
+All times are UTC. Several trading days are shown on one continuous chart with
+the overnight/weekend gaps collapsed.
 """
 import sqlite3
 from contextlib import closing
@@ -19,9 +19,8 @@ from plotly.subplots import make_subplots
 DB_PATH = "market_data.db"
 FREQUENCIES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
 RV_WINDOW = 30  # number of consecutive 1-minute returns
-# Exchange timezone for display, by ticker suffix; anything else is treated as US.
-EXCHANGE_TZ = {".PA": "Europe/Paris"}
-DEFAULT_TZ = "America/New_York"
+DEFAULT_DAYS = 5  # trading days shown when a ticker is first selected
+GAP = pd.Timedelta("1h")  # gaps longer than this between bars are collapsed on the chart
 
 
 def query(sql, params=()):
@@ -36,39 +35,25 @@ def load_tickers():
 
 
 @st.cache_data
-def load_dates(ticker):
+def load_ticker(ticker):
+    """All 1-minute bars for one ticker, indexed by UTC timestamp."""
     df = query(
-        "SELECT DISTINCT date(ts, 'unixepoch') AS d FROM bars_1m WHERE ticker = ? ORDER BY d DESC",
+        "SELECT ts, open, high, low, close, volume FROM bars_1m WHERE ticker = ? ORDER BY ts",
         (ticker,),
-    )
-    return df["d"].tolist()
-
-
-@st.cache_data
-def load_day(ticker, date):
-    """1-minute bars for one ticker and one (UTC) date, indexed by UTC timestamp."""
-    df = query(
-        """SELECT ts, open, high, low, close, volume FROM bars_1m
-           WHERE ticker = ? AND date(ts, 'unixepoch') = ? ORDER BY ts""",
-        (ticker, date),
     )
     df.index = pd.to_datetime(df.pop("ts"), unit="s", utc=True)
     return df
 
 
-def resample(df_1m, minutes):
-    """Aggregate 1m bars into OHLCV candles labelled by their start time.
+def resample_day(day_1m, minutes):
+    """Aggregate one day's 1m bars into OHLCV candles labelled by their start time.
 
-    Buckets are anchored to the session open (first bar floored to 30 min), so
-    US hourly candles are 09:30-10:29, 10:30-11:29, ... instead of starting at
-    09:00 with a half-empty first bar.
+    Buckets are anchored to the day's first bar floored to 30 min, so a session
+    opening at 13:30 UTC gets hourly candles 13:30, 14:30, ... rather than a
+    half-empty 13:00 candle.
     """
-    if minutes == 1:
-        out = df_1m.copy()
-        out["n_minutes"] = 1
-        return out
-    origin = df_1m.index[0].floor("30min")
-    out = df_1m.resample(f"{minutes}min", origin=origin, label="left", closed="left").agg(
+    origin = day_1m.index[0].floor("30min")
+    out = day_1m.resample(f"{minutes}min", origin=origin, label="left", closed="left").agg(
         open=("open", "first"),
         high=("high", "max"),
         low=("low", "min"),
@@ -79,26 +64,32 @@ def resample(df_1m, minutes):
     return out[out["n_minutes"] > 0]  # drop buckets with no data at all
 
 
+def resample(df_1m, minutes):
+    if minutes == 1:
+        return df_1m.assign(n_minutes=1)
+    return pd.concat(resample_day(day, minutes) for _, day in df_1m.groupby(df_1m.index.date))
+
+
 def realized_vol(df_1m, window=RV_WINDOW):
     """RV_t = 100 * sqrt(sum of the last `window` squared 1m log returns).
 
-    Only returns within the selected day are used (no overnight return), so
-    the first value appears at the 31st bar of the session.
+    Computed separately for each trading day (no overnight returns), so each
+    day's line starts at its 31st bar.
     """
-    r = np.log(df_1m["close"] / df_1m["close"].shift(1))
-    return 100 * np.sqrt((r**2).rolling(window, min_periods=window).sum())
+    def one_day(close):
+        r = np.log(close / close.shift(1))
+        return 100 * np.sqrt((r**2).rolling(window, min_periods=window).sum())
+
+    close = df_1m["close"]
+    return close.groupby(close.index.date, group_keys=False).apply(one_day)
 
 
-def exchange_tz(ticker):
-    return next((tz for sfx, tz in EXCHANGE_TZ.items() if ticker.endswith(sfx)), DEFAULT_TZ)
+def naive(index):
+    """Plotly ignores tz-aware datetimes; drop the tz so it plots UTC as-is."""
+    return index.tz_localize(None)
 
 
-def to_display_tz(index, tz):
-    """Plotly ignores tz-aware datetimes, so convert to naive wall-clock time."""
-    return index.tz_convert(tz).tz_localize(None)
-
-
-def build_chart(bars, rv, tz, freq):
+def build_chart(bars, rv, df_1m, freq):
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
         row_heights=[0.72, 0.28],
@@ -114,23 +105,37 @@ def build_chart(bars, rv, tz, freq):
     ]
     fig.add_trace(
         go.Candlestick(
-            x=to_display_tz(bars.index, tz),
+            x=naive(bars.index),
             open=bars["open"], high=bars["high"], low=bars["low"], close=bars["close"],
             text=hover, name="OHLC", showlegend=False,
         ),
         row=1, col=1,
     )
     fig.add_trace(
-        go.Scatter(x=to_display_tz(rv.index, tz), y=rv, mode="lines", name="RV",
+        go.Scatter(x=naive(rv.index), y=rv, mode="lines", name="RV",
                    line=dict(width=1.5), showlegend=False,
-                   hovertemplate="%{x|%H:%M}<br>RV: %{y:.3f}%<extra></extra>"),
+                   hovertemplate="%{x|%Y-%m-%d %H:%M}<br>RV: %{y:.3f}%<extra></extra>"),
         row=2, col=1,
     )
+
+    # Collapse overnight / weekend gaps so consecutive trading days sit side by side,
+    # and mark where each new day starts.
+    ts = naive(df_1m.index).to_series()
+    gaps = ts.diff()
+    breaks = [
+        dict(values=[(start + pd.Timedelta("1min")).isoformat()],
+             dvalue=(gap - pd.Timedelta("1min")).total_seconds() * 1000)
+        for start, gap in zip(ts.shift(1)[gaps > GAP], gaps[gaps > GAP])
+    ]
+    fig.update_xaxes(rangebreaks=breaks)
+    for day_start in ts[gaps > GAP]:
+        fig.add_vline(x=day_start, line=dict(width=1, dash="dot", color="grey"), opacity=0.5)
+
     fig.update_layout(height=720, margin=dict(l=10, r=10, t=40, b=10),
                       xaxis_rangeslider_visible=False, hovermode="x unified")
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="RV %", rangemode="tozero", row=2, col=1)
-    fig.update_xaxes(title_text=f"Time ({tz})", row=2, col=1)
+    fig.update_xaxes(title_text="Time (UTC)", row=2, col=1)
     return fig
 
 
@@ -144,37 +149,49 @@ def main():
         st.error(f"Could not read {DB_PATH}: {e}. Run `python main.py` first.")
         st.stop()
 
-    c1, c2, c3, c4 = st.columns([1, 1, 2, 1])
+    c1, c2 = st.columns([1, 2])
     ticker = c1.selectbox("Ticker", tickers)
-    date = c2.selectbox("Trading date (UTC)", load_dates(ticker))
-    freq = c3.segmented_control("Frequency", list(FREQUENCIES), default="5m") or "5m"
-    use_utc = c4.radio("Time zone", ["Exchange", "UTC"], horizontal=True) == "UTC"
-    tz = "UTC" if use_utc else exchange_tz(ticker)
+    freq = c2.segmented_control("Frequency", list(FREQUENCIES), default="5m") or "5m"
 
-    df_1m = load_day(ticker, date)
-    if df_1m.empty:
-        st.warning("No data for this selection.")
+    all_1m = load_ticker(ticker)
+    if all_1m.empty:
+        st.warning("No data for this ticker.")
         st.stop()
 
+    dates = sorted(set(all_1m.index.date))
+    if len(dates) > 1:
+        start, end = st.select_slider(
+            "Trading dates (UTC)", options=dates,
+            value=(dates[max(0, len(dates) - DEFAULT_DAYS)], dates[-1]),
+            format_func=lambda d: d.strftime("%a %d %b"), key=f"dates_{ticker}",
+        )
+    else:
+        start = end = dates[0]
+        st.caption(f"Only one trading date for {ticker}: {start:%a %d %b %Y}")
+
+    in_range = (all_1m.index.date >= start) & (all_1m.index.date <= end)
+    df_1m = all_1m[in_range]
     bars = resample(df_1m, FREQUENCIES[freq])
     rv = realized_vol(df_1m)
 
-    day_ret = 100 * (df_1m["close"].iloc[-1] / df_1m["open"].iloc[0] - 1)
+    ret = 100 * (df_1m["close"].iloc[-1] / df_1m["open"].iloc[0] - 1)
+    n_days = len(set(df_1m.index.date))
     m = st.columns(5)
-    m[0].metric("Close", f"{df_1m['close'].iloc[-1]:.2f}", f"{day_ret:+.2f}% on day")
-    m[1].metric("Day range", f"{df_1m['low'].min():.2f} - {df_1m['high'].max():.2f}")
+    m[0].metric("Last close", f"{df_1m['close'].iloc[-1]:.2f}",
+                f"{ret:+.2f}% over {n_days} day{'s' if n_days > 1 else ''}")
+    m[1].metric("Range", f"{df_1m['low'].min():.2f} - {df_1m['high'].max():.2f}")
     m[2].metric("Volume", f"{df_1m['volume'].sum():,.0f}")
     m[3].metric("Latest RV", "n/a" if rv.dropna().empty else f"{rv.dropna().iloc[-1]:.3f}%")
     incomplete = int((bars["n_minutes"] < FREQUENCIES[freq]).sum())
     m[4].metric(f"{freq} bars", f"{len(bars)}", f"{incomplete} incomplete" if incomplete else None,
                 delta_color="off")
 
-    st.plotly_chart(build_chart(bars, rv, tz, freq), width="stretch")
+    st.plotly_chart(build_chart(bars, rv, df_1m, freq), width="stretch")
 
     with st.expander("Bar data"):
         table = bars.copy()
-        table.index = to_display_tz(table.index, tz)
-        table.index.name = f"start ({tz})"
+        table.index = naive(table.index)
+        table.index.name = "start (UTC)"
         st.dataframe(table, width="stretch")
 
 
